@@ -12,12 +12,13 @@
 | [marketplace-ui](https://github.com/DariaGuzich/marketplace-ui) | страница настроек (React) | 5173 |
 | [marketplace-serving](https://github.com/DariaGuzich/marketplace-serving) | фейковый Serving: принимает конфиги, решает о показе | 8081 |
 | [marketplace-publisher](https://github.com/DariaGuzich/marketplace-publisher) | Config publisher: outbox → Serving | — |
+| [marketplace-reporting](https://github.com/DariaGuzich/marketplace-reporting) | события от Serving, почасовые агрегаты (схема `reporting`) | 8082 |
 | marketplace-infra (этот) | docker-compose, общие инструкции | — |
 
 ```
 marketplace-ui → marketplace-bff → marketplace-api → PostgreSQL (settings, outbox)
                                                          ↓  marketplace-publisher (читает outbox)
-                                                    marketplace-serving
+                                                    marketplace-serving ──события──► marketplace-reporting → PostgreSQL (схема reporting)
 ```
 
 ## Что поднимает docker-compose
@@ -47,7 +48,9 @@ docker compose exec postgres psql -U marketplace
 \dt                                                        -- таблицы
 SELECT * FROM settings;
 SELECT id, account_id, version, status, payload FROM outbox ORDER BY id;
-SELECT version, description, success FROM flyway_schema_history;   -- применённые миграции
+SELECT version, description, success FROM flyway_schema_history;   -- применённые миграции API
+SELECT * FROM reporting.events ORDER BY event_time;                 -- события Reporting (своя схема)
+SELECT * FROM reporting.hourly_stats ORDER BY hour, account_id;
 ```
 
 ## Запуск всей системы
@@ -58,8 +61,9 @@ SELECT version, description, success FROM flyway_schema_history;   -- приме
 2. `mvn spring-boot:run` — в marketplace-api (при старте Flyway применит миграции);
 3. `npm start` — в marketplace-bff;
 4. `npm run dev` — в marketplace-ui, затем открыть http://localhost:5173;
-5. `mvn spring-boot:run` — в marketplace-serving;
-6. `mvn spring-boot:run` — в marketplace-publisher (после API: таблицу outbox создают миграции API).
+5. `mvn spring-boot:run` — в marketplace-reporting;
+6. `mvn spring-boot:run` — в marketplace-serving;
+7. `mvn spring-boot:run` — в marketplace-publisher (после API: таблицу outbox создают миграции API).
 
 ## Инструменты
 

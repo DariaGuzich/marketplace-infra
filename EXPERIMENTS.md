@@ -512,3 +512,72 @@ serving() { curl -s localhost:8081/debug/config/pub-1; echo; }
 4. Откат на несуществующую версию (`to_version=999`) → 404.
 5. Откат на невалидную версию из эксперимента 26: API создаст новую версию, publisher пометит её `FAILED`,
    Serving останется на прежней. Откат не обходит валидацию.
+
+---
+
+## Шаг 5 второго этапа: marketplace-reporting
+
+Подготовка: `docker compose up -d` (здесь), `mvn spring-boot:run` в marketplace-reporting (8082) и
+в marketplace-serving (8081). Команды — для Git Bash.
+
+```bash
+J='Content-Type: application/json'
+event()     { curl -s -X POST localhost:8082/events -H "$J" -d "{\"event_id\": \"$1\", \"account_id\": \"rep-1\", \"timestamp\": \"$2\", \"shown\": ${3:-true}}"; echo; }
+aggregate() { curl -s -X POST "localhost:8082/admin/aggregate?hour=$1"; echo; }
+report()    { curl -s localhost:8082/reports/rep-1; echo; }
+```
+
+Где смотреть: `report`, в psql `SELECT * FROM reporting.events WHERE account_id = 'rep-1';` и
+`SELECT * FROM reporting.hourly_stats WHERE account_id = 'rep-1';`, в логе Reporting `Aggregated hour ...`.
+
+Автотесты (marketplace-reporting): `ReportingApiTest`, `AggregationJobTest`; (marketplace-serving): `EventSendingTest`.
+Эксперименты 31–35 и 37 проверены вручную (аналогичными запросами), 36 — нет.
+
+### 31. События от Serving
+
+1. `curl -X POST localhost:8081/ad-request -H "$J" -d '{"account_id": "rep-1", "domain": "news.com", "bid_price": 2}'` — три раза.
+2. **Ожидаемо:** в `reporting.events` три строки с разными `event_id` и временем «сейчас» (UTC).
+
+### 32. Агрегация за конкретный час и границы часа
+
+```bash
+event e1 2026-10-01T07:59:59Z          # предыдущий час
+event e2 2026-10-01T08:00:00Z          # начало часа — входит
+event e3 2026-10-01T08:30:00Z false
+event e4 2026-10-01T09:00:00Z          # следующий час
+aggregate 2026-10-01T08:00:00Z         # {"hour":"2026-10-01T08:00:00Z","accounts":1}
+report                                 # [{"hour":"2026-10-01T08:00:00Z","requests":2,"shown":1}]
+```
+
+### 33. Дубли событий
+
+1. `event e5 2026-10-01T08:40:00Z` → `{"stored":true}`, ещё раз то же → `{"stored":false}`.
+2. `aggregate 2026-10-01T08:00:00Z`, `report` → `requests` выросло на 1, а не на 2.
+3. Так выглядит повтор Serving после таймаута: Reporting событие уже сохранил, а Serving об этом не узнал.
+
+### 34. Повторный запуск агрегации
+
+`aggregate 2026-10-01T08:00:00Z` ещё 2–3 раза → `report` не меняется. Агрегаты пересчитываются из сырых событий
+и заменяют прежние (см. README marketplace-reporting).
+
+### 35. Позднее событие
+
+1. `event late-1 2026-10-01T08:59:00Z` — событие за уже посчитанный час.
+2. `report` — **не изменился**: событие сохранено в `events`, но агрегат за 08:00 старый.
+3. `aggregate 2026-10-01T08:00:00Z` → `report` учёл событие.
+4. Расписание считает только предыдущий час и к 08:00 само не вернётся. Как это решают — в README marketplace-reporting.
+
+### 36. Запуск по расписанию (не проверялось)
+
+1. Перезапусти Reporting с `AGGREGATION_CRON="0 * * * * *"` (каждую минуту;
+   PowerShell: `$env:AGGREGATION_CRON="0 * * * * *"; mvn spring-boot:run`).
+2. **Ожидаемо:** в начале каждой минуты в логе `Aggregated hour <предыдущий час>: N account(s)`. События из
+   эксперимента 31 попадут в отчёт, когда закончится их час и пройдёт следующая минута.
+
+### 37. Reporting недоступен
+
+1. Останови Reporting, отправь `ad-request` (как в 31).
+2. **Ожидаемо:** ответ приходит, как обычно, но заметно позже. В логе Serving: `Attempt 1/3 ... failed: ... Connection refused`,
+   `Attempt 2/3`, `Attempt 3/3`, затем `Event ... lost: Reporting unavailable after 3 attempts`.
+3. Вывод: для конфигов (outbox) недоступность получателя не приводит к потерям, для событий — приводит.
+   Это сознательное упрощение (см. README marketplace-serving), вернёмся к нему в шаге 7.
