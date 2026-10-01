@@ -581,3 +581,76 @@ report                                 # [{"hour":"2026-10-01T08:00:00Z","reques
    `Attempt 2/3`, `Attempt 3/3`, затем `Event ... lost: Reporting unavailable after 3 attempts`.
 3. Вывод: для конфигов (outbox) недоступность получателя не приводит к потерям, для событий — приводит.
    Это сознательное упрощение (см. README marketplace-serving), вернёмся к нему в шаге 7.
+
+---
+
+## Шаг 6 второго этапа: BFF — N+1, лимиты, отказ сервиса, retry
+
+Подготовка: `docker compose up -d` (здесь), запущены marketplace-api (8080) и marketplace-reporting (8082),
+у нескольких аккаунтов есть настройки (`curl localhost:8080/accounts`). BFF запускается в каждом эксперименте
+по-своему: `npm start` в marketplace-bff. Запросы удобно отправлять в GraphiQL: http://localhost:4000/graphql.
+
+Где смотреть: ответ GraphQL и строки `[api] ...` / `[reporting] ...` в логе BFF — каждая строка это один
+HTTP-запрос к соседу.
+
+Автотесты (marketplace-bff): `n-plus-one.test.ts`, `limits.test.ts`, `reporting-failure.test.ts`, `retry.test.ts`.
+Вручную проверены: 38, 39.1, 40 и 42.1. Остальное — прогноз: 39.3 — расчёт по измеренной стоимости одной копии
+(6.5), 41 и 42.3 покрыты автотестами (`reporting-failure.test.ts`, `retry.test.ts`), но вживую не запускались.
+
+### 38. N+1 и DataLoader
+
+```graphql
+query { accounts { id settings { floorPrice } } }
+```
+
+1. `USE_DATALOADER=false npm start` (PowerShell: `$env:USE_DATALOADER="false"; npm start`), выполни запрос.
+   **Ожидаемо в логе:** `[api] GET /accounts`, затем по строке `[api] GET /accounts/<id>/settings` **на каждый
+   аккаунт** (при проверке — 1 + 5).
+2. `npm start` (по умолчанию DataLoader включён), тот же запрос.
+   **Ожидаемо:** две строки — `GET /accounts` и `GET /settings?account_ids=...&account_ids=...`.
+3. Создай ещё несколько аккаунтов (PUT в API) и повтори: без DataLoader строк становится больше, с ним — всегда 2.
+
+### 39. Лимиты глубины и сложности
+
+1. Слишком глубокий запрос (цикл `Settings.account` ↔ `Account.settings`):
+   ```graphql
+   query { accounts { settings { account { settings { account { settings { account { id } } } } } } } }
+   ```
+   **Ожидаемо:** `Syntax Error: Query depth limit of 6 exceeded, found 8.`, в логе BFF **ни одного** `[api]`:
+   запрос отклонён до выполнения.
+2. Убери один уровень `account { settings { ... } }` — глубина 6, запрос выполняется.
+3. Широкий запрос: 200 копий `sN: settings(accountId: "x") { floorPrice currency blockedDomains }` (каждая стоит
+   6.5). **Ожидаемо:** `Query Cost limit of 1000 exceeded, found 1300.`. 150 копий (975) пройдут.
+4. Перезапусти с `MAX_DEPTH=10 MAX_COST=100000` — те же запросы выполняются, и широкий запрос делает 200
+   запросов в API.
+
+### 40. Отказ Reporting
+
+```graphql
+query { accounts { id settings { floorPrice } report { hour requests shown } } }
+```
+
+1. Reporting запущен → `report` — список (пустой, если агрегаций для аккаунта нет).
+2. Останови Reporting, повтори запрос. **Ожидаемо:** `settings` на месте, `report: null`, в `errors` по одной
+   ошибке `Reporting unavailable: fetch failed` на аккаунт с `path: ["accounts", N, "report"]`.
+3. Обрати внимание на лог: `[reporting] GET /reports/<id>` для каждого аккаунта. У `report` свой N+1.
+
+### 41. Таймаут
+
+1. Запусти BFF с очень маленьким таймаутом Reporting: `REPORTING_TIMEOUT_MS=1 npm start`.
+2. Запрос из 40 при работающем Reporting. **Ожидаемо:** `report: null`, ошибка про прерванный запрос
+   (timeout / aborted), настройки на месте. Ответ приходит сразу, BFF не ждёт Reporting.
+   Задержку в сети можно будет устроить и честнее, через Toxiproxy в шаге 7.
+
+### 42. Retry мутации с Idempotency-Key
+
+```graphql
+mutation { addBlockedDomain(accountId: "<id>", domain: "via-bff.com") { blockedDomains } }
+```
+
+1. Обычный вызов: домен добавлен, в логе одна строка `[api] POST /accounts/<id>/blocked-domains`.
+2. Повтор после сбоя вручную воспроизвести трудно: нужно, чтобы API обработал запрос, а ответ потерялся.
+   Это покрыто автотестом `retry.test.ts` (первый ответ 503 после обработки → повтор с тем же ключом →
+   домен один раз). В шаге 7 то же самое можно будет устроить через Toxiproxy между BFF и API.
+3. Если API остановлен: в логе BFF три строки `addBlockedDomain attempt N/3 failed (fetch failed), key ...`
+   с **одинаковым** ключом, затем ошибка `Marketplace API unavailable after 3 attempts`.
