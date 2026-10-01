@@ -406,3 +406,109 @@ ad news.com 5      # показано: ok
 2. `curl -i localhost:8081/debug/config/acc-1` → **404**, `ad news.com 5` → `no config for account`.
 3. Конфиг хранится в памяти и потерян. Publisher (шаг 4) уже доставил все версии и повторно их не пришлёт.
    Это сознательное упрощение (см. README marketplace-serving): настоящий Serving при старте загружает снапшот.
+
+---
+
+## Шаг 4 второго этапа: marketplace-publisher
+
+Подготовка, каждое в своём окне:
+1. `docker compose up -d` (здесь);
+2. `mvn spring-boot:run` в marketplace-api (8080);
+3. `mvn spring-boot:run` в marketplace-serving (8081);
+4. publisher запускается в каждом эксперименте по-своему: `mvn spring-boot:run` в marketplace-publisher.
+
+Команды — для Git Bash:
+
+```bash
+J='Content-Type: application/json'
+put() { curl -s -X PUT localhost:8080/accounts/pub-1/settings -H "$J" -d "{\"floor_price\": $1, \"currency\": \"${2:-USD}\", \"blocked_domains\": []}"; echo; }
+serving() { curl -s localhost:8081/debug/config/pub-1; echo; }
+```
+
+Где смотреть:
+- **база:** `docker compose exec postgres psql -U marketplace -c "SELECT version, status FROM outbox WHERE account_id = 'pub-1' ORDER BY version;"`;
+- **Serving:** `serving` и строки `Applied` / `Ignored` в логе Serving;
+- **publisher:** строки `Delivered`, `Invalid config`, `Attempt`, `Serving unavailable`, `CRASH_AFTER_SEND` в его логе.
+
+Автотесты (marketplace-publisher): `PublisherTest`, `CrashAfterSendTest`, `ConfigValidatorTest`;
+(marketplace-api): `RollbackApiTest`.
+
+Вручную проверены: 24, 25, 26 (шаги 1–2), 27, 28, 30 (шаги 1–3). Остальное — прогноз: валюта `dollars` и порядок
+для нескольких аккаунтов подтверждены автотестами (`PublisherTest`), откат на невалидную версию (30.5) не проверялся.
+Номера версий будут другими, если у `pub-1` уже есть версии.
+
+### 24. Доставка и сравнение версии в БД и в Serving
+
+1. Publisher запущен. `put 1.5`, через 3–4 секунды `serving`.
+2. **Ожидаемо:** в outbox версия 0 со статусом `SENT`, в Serving `"version": 0`. Лог publisher:
+   `Delivered account pub-1 version 0`.
+3. Версия в API (`curl localhost:8080/accounts/pub-1/settings`) совпадает с версией в Serving. Если они
+   различаются, значит, есть недоставленные записи (`NEW`) или publisher не работает. Это главная проверка
+   «доехало ли изменение».
+
+### 25. Отказ publisher
+
+1. Останови publisher (Ctrl+C).
+2. `put 2.5`, `put 3.5` → в outbox две записи `NEW`, `serving` показывает старую версию: изменения в API есть,
+   до Serving они не дошли.
+3. Запусти publisher. **Ожидаемо:** через 3 секунды обе записи `SENT`, в логе `Delivered ... version 1`,
+   затем `version 2` (по порядку), Serving на последней версии. Ничего не потеряно: outbox сохранил всё,
+   пока publisher лежал.
+
+### 26. Невалидный конфиг
+
+1. `put -1` (отрицательная цена), затем `put 4.5`.
+2. **Ожидаемо:** в логе publisher `Invalid config, account pub-1 version N marked as FAILED: [floor_price must be >= 0, got -1]`,
+   затем `Delivered ... version N+1`. В outbox: `FAILED`, потом `SENT`. Serving ни разу не видел невалидную
+   версию.
+3. То же с `put 5 dollars` (валюта не из 3 заглавных букв).
+4. Обрати внимание: API сохранил невалидные настройки (`curl` к API их показывает), а в Serving их нет.
+   Источник правды и Serving разошлись. Это следствие того, что валидация есть только в publisher.
+   Правильнее отвергать такие значения ещё в API (400).
+
+### 27. Повторная доставка (падение после отправки)
+
+1. Останови publisher. `put 6.5`.
+2. Запусти publisher с падением: `CRASH_AFTER_SEND=true mvn spring-boot:run`
+   (PowerShell: `$env:CRASH_AFTER_SEND="true"; mvn spring-boot:run`).
+3. **Ожидаемо:** в логе `Delivered account pub-1 version N`, затем
+   `CRASH_AFTER_SEND: ... sent, but NOT marked as SENT. Halting the process.`, процесс завершился.
+   Serving уже на версии N, а в outbox она `NEW`.
+4. Запусти publisher без переменной (в PowerShell сначала `Remove-Item Env:CRASH_AFTER_SEND`).
+   **Ожидаемо:** `Delivered account pub-1 version N, but Serving ignored it: current version is N`,
+   в логе Serving `Ignored config ... version N is not newer than current version N`, в outbox `SENT`.
+5. Вывод: дубль возник и был безопасно отброшен получателем. Так работает at-least-once + идемпотентный получатель.
+
+### 28. Отказ Serving и retry
+
+1. Publisher запущен. Останови Serving. `put 7.5`.
+2. **Ожидаемо** в логе publisher, по кругу раз в ~3 секунды:
+   `Attempt 1/3 ... failed: I/O error ... Connection refused`, `Attempt 2/3`, `Attempt 3/3`,
+   `Serving unavailable, stopping this cycle. Account pub-1 version N stays NEW`.
+3. Запусти Serving. **Ожидаемо:** в следующем цикле `Delivered ... version N`, запись `SENT`.
+4. Обрати внимание: после перезапуска Serving знает **только** версию N. Все предыдущие версии потеряны вместе
+   с памятью процесса, а publisher досылает только новые записи. Для этого аккаунта это не страшно (у него есть
+   последняя версия), но аккаунт, который в это время не менялся, останется в Serving без конфига
+   (см. эксперимент 23).
+
+### 29. Порядок изменений
+
+1. Останови publisher. Сделай несколько изменений подряд для двух аккаунтов:
+   `put 1`, `put 2`, `put 3` для `pub-1` и то же для `pub-2` (поменяй аккаунт в функции `put`).
+2. Запусти publisher. **Ожидаемо:** в логе версии каждого аккаунта идут строго по возрастанию
+   (`ORDER BY account_id, version`), Serving на последних версиях.
+3. Что было бы без порядка: если бы `put 3` дошёл раньше `put 2`, Serving применил бы 3, а 2 проигнорировал
+   бы как устаревшую. Итог тот же. Защита версиями работает, даже когда порядок нарушен: порядок здесь
+   экономит лишние отправки, а корректность обеспечивают версии.
+
+### 30. Откат
+
+1. Publisher и Serving запущены. Посмотри версии: `SELECT version, payload FROM outbox WHERE account_id = 'pub-1' ORDER BY version;`.
+2. Откати на одну из старых версий:
+   `curl -X POST "localhost:8080/accounts/pub-1/settings/rollback?to_version=0"`.
+3. **Ожидаемо:** ответ — **новая** версия (последняя + 1) со значениями версии 0, в outbox новая запись,
+   через 3 секунды `serving` показывает её. Номера версий только растут: если бы откат возвращал номер 0,
+   Serving отбросил бы его как устаревший.
+4. Откат на несуществующую версию (`to_version=999`) → 404.
+5. Откат на невалидную версию из эксперимента 26: API создаст новую версию, publisher пометит её `FAILED`,
+   Serving останется на прежней. Откат не обходит валидацию.

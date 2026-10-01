@@ -11,11 +11,12 @@
 | [marketplace-bff](https://github.com/DariaGuzich/marketplace-bff) | GraphQL BFF (Node.js, TypeScript) | 4000 |
 | [marketplace-ui](https://github.com/DariaGuzich/marketplace-ui) | страница настроек (React) | 5173 |
 | [marketplace-serving](https://github.com/DariaGuzich/marketplace-serving) | фейковый Serving: принимает конфиги, решает о показе | 8081 |
+| [marketplace-publisher](https://github.com/DariaGuzich/marketplace-publisher) | Config publisher: outbox → Serving | — |
 | marketplace-infra (этот) | docker-compose, общие инструкции | — |
 
 ```
 marketplace-ui → marketplace-bff → marketplace-api → PostgreSQL (settings, outbox)
-                                                         ↓  (шаг 4: marketplace-publisher)
+                                                         ↓  marketplace-publisher (читает outbox)
                                                     marketplace-serving
 ```
 
@@ -57,7 +58,8 @@ SELECT version, description, success FROM flyway_schema_history;   -- приме
 2. `mvn spring-boot:run` — в marketplace-api (при старте Flyway применит миграции);
 3. `npm start` — в marketplace-bff;
 4. `npm run dev` — в marketplace-ui, затем открыть http://localhost:5173;
-5. `mvn spring-boot:run` — в marketplace-serving (пока работает отдельно: доставки конфига ещё нет).
+5. `mvn spring-boot:run` — в marketplace-serving;
+6. `mvn spring-boot:run` — в marketplace-publisher (после API: таблицу outbox создают миграции API).
 
 ## Инструменты
 
