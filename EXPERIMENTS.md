@@ -354,3 +354,55 @@ wait
 **С выключенной блокировкой** (`OPTIMISTIC_LOCKING_ENABLED=false`): если запросы не пересеклись, оба получат 200
 (lost update, как в эксперименте 19). Если пересеклись, второй всё равно получит 409 от `@Version`:
 одновременные записи Hibernate защищает всегда (см. README API, «Идемпотентность и optimistic locking»).
+
+---
+
+## Шаг 3 второго этапа: marketplace-serving
+
+Подготовка: `mvn spring-boot:run` в marketplace-serving (порт 8081). Команды — для Git Bash.
+
+```bash
+J='Content-Type: application/json'
+config() { curl -s -X POST localhost:8081/config -H "$J" -d "{\"account_id\": \"acc-1\", \"version\": $1, \"floor_price\": $2, \"currency\": \"USD\", \"blocked_domains\": [\"bad.com\"]}"; echo; }
+ad()     { curl -s -X POST localhost:8081/ad-request -H "$J" -d "{\"account_id\": \"acc-1\", \"domain\": \"$1\", \"bid_price\": $2}"; echo; }
+```
+
+Автотесты (marketplace-serving): `ConfigStoreTest`, `AdDecisionTest`, `ServingApiTest`.
+
+### 21. Версии: новая, старая, повторная
+
+```bash
+ad news.com 2      # {"shown":false,"reason":"no config for account",...} — конфиг ещё не доставлен
+config 2 1.5       # {"applied":true,"current_version":2}
+config 1 0.5       # {"applied":false,"current_version":2} — старая версия (доставка не по порядку)
+config 2 9         # {"applied":false,"current_version":2} — та же версия ещё раз (повторная доставка)
+config 3 3         # {"applied":true,"current_version":3}
+curl localhost:8081/debug/config/acc-1     # version 3, floor_price 3
+```
+
+**Ожидаемо в логах Serving:** `Applied ... version 2`, `Ignored ... version 1 is not newer than current version 2`,
+`Ignored ... version 2 ...`, `Applied ... version 3`.
+
+Обрати внимание: `config 2 9` — та же версия, но **с другими данными** — тоже проигнорирован. Serving доверяет
+номеру версии, а не содержимому. Если отправитель по ошибке присвоит одну версию разным данным, Serving этого
+не заметит. Поэтому версии назначает только один источник — API в транзакции с изменением.
+
+### 22. Решение о показе
+
+После эксперимента 21 (`floor_price` 3, `bad.com` заблокирован):
+
+```bash
+ad news.com 2      # не показано: bid is below floor price
+ad bad.com 100     # не показано: domain is blocked
+ad news.com 5      # показано: ok
+```
+
+`config_version` в каждом ответе — по какой версии конфига принято решение. Это пригодится в шагах 4–5:
+видно, «доехало» ли изменение настроек до Serving.
+
+### 23. Перезапуск Serving
+
+1. Останови и снова запусти Serving.
+2. `curl -i localhost:8081/debug/config/acc-1` → **404**, `ad news.com 5` → `no config for account`.
+3. Конфиг хранится в памяти и потерян. Publisher (шаг 4) уже доставил все версии и повторно их не пришлёт.
+   Это сознательное упрощение (см. README marketplace-serving): настоящий Serving при старте загружает снапшот.

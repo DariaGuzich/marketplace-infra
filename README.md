@@ -10,10 +10,13 @@
 | [marketplace-api](https://github.com/DariaGuzich/marketplace-api) | REST API настроек (Java, Spring Boot), PostgreSQL | 8080 |
 | [marketplace-bff](https://github.com/DariaGuzich/marketplace-bff) | GraphQL BFF (Node.js, TypeScript) | 4000 |
 | [marketplace-ui](https://github.com/DariaGuzich/marketplace-ui) | страница настроек (React) | 5173 |
+| [marketplace-serving](https://github.com/DariaGuzich/marketplace-serving) | фейковый Serving: принимает конфиги, решает о показе | 8081 |
 | marketplace-infra (этот) | docker-compose, общие инструкции | — |
 
 ```
-marketplace-ui → marketplace-bff → marketplace-api → PostgreSQL
+marketplace-ui → marketplace-bff → marketplace-api → PostgreSQL (settings, outbox)
+                                                         ↓  (шаг 4: marketplace-publisher)
+                                                    marketplace-serving
 ```
 
 ## Что поднимает docker-compose
@@ -53,7 +56,8 @@ SELECT version, description, success FROM flyway_schema_history;   -- приме
 1. `docker compose up -d` — здесь, в marketplace-infra;
 2. `mvn spring-boot:run` — в marketplace-api (при старте Flyway применит миграции);
 3. `npm start` — в marketplace-bff;
-4. `npm run dev` — в marketplace-ui, затем открыть http://localhost:5173.
+4. `npm run dev` — в marketplace-ui, затем открыть http://localhost:5173;
+5. `mvn spring-boot:run` — в marketplace-serving (пока работает отдельно: доставки конфига ещё нет).
 
 ## Инструменты
 
