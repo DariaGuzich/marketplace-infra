@@ -282,3 +282,75 @@ Run workflow) или локально выполнить `npm run gen:api && npm
 2. **Ожидаемо:** приложение не стартует — `Migration checksum mismatch for migration version 1`.
    Flyway хранит контрольную сумму каждого применённого файла. Применённые миграции не правят — пишут новую.
 3. Верни файл (`git checkout src/main/resources/db/migration`).
+
+---
+
+## Шаг 2 второго этапа: идемпотентность и race condition
+
+Подготовка: `docker compose up -d` (здесь), `mvn spring-boot:run` в marketplace-api. Команды ниже — для **Git Bash**
+(в PowerShell вместо `curl` пиши `curl.exe` и экранируй кавычки в JSON: `'{\"domain\": \"bad.com\"}'`).
+
+```bash
+J='Content-Type: application/json'
+curl -X PUT localhost:8080/accounts/exp-2/settings -H "$J" -d '{"floor_price": 1.5, "currency": "USD", "blocked_domains": []}'
+```
+
+Автотесты (marketplace-api): `IdempotencyApiTest`, `OptimisticLockingApiTest`, `LostUpdateApiTest`.
+
+### 18. Неидемпотентный POST и Idempotency-Key
+
+1. Дважды без ключа (так выглядит retry клиента после таймаута):
+   ```bash
+   curl -X POST localhost:8080/accounts/exp-2/blocked-domains -H "$J" -d '{"domain": "spam.net"}'
+   curl -X POST localhost:8080/accounts/exp-2/blocked-domains -H "$J" -d '{"domain": "spam.net"}'
+   ```
+   **Ожидаемо:** `"blocked_domains": ["spam.net", "spam.net"]`, версия выросла дважды, в outbox две новые записи.
+2. Дважды с одним ключом:
+   ```bash
+   curl -X POST localhost:8080/accounts/exp-2/blocked-domains -H "$J" -H "Idempotency-Key: key-1" -d '{"domain": "bad.com"}'
+   curl -X POST localhost:8080/accounts/exp-2/blocked-domains -H "$J" -H "Idempotency-Key: key-1" -d '{"domain": "bad.com"}'
+   ```
+   **Ожидаемо:** оба ответа одинаковые, включая `version`. `bad.com` в списке один раз, в outbox одна новая запись.
+3. Тот же ключ, другой домен (`-d '{"domain": "other.com"}'`): **ожидаемо** вернётся сохранённый ответ, `other.com`
+   не добавится. Это упрощение: настоящие API в таком случае отвечают ошибкой (см. README API).
+4. Где смотреть: `SELECT idempotency_key, response FROM idempotency_keys;` в psql.
+
+### 19. Lost update: последовательный сценарий
+
+Двое редактируют одни настройки: оба прочитали `version`, первый сохранил, второй сохраняет поверх.
+
+1. `curl localhost:8080/accounts/exp-2/settings` — запомни `version` (допустим, `N`).
+2. «Пользователь B» меняет валюту:
+   `curl -X PUT localhost:8080/accounts/exp-2/settings -H "$J" -d '{"floor_price": 1.5, "currency": "EUR", "blocked_domains": [], "version": N}'`
+   → 200, версия `N+1`.
+3. «Пользователь A» меняет цену, но шлёт то, что видел он, включая `version: N`:
+   `curl -i -X PUT localhost:8080/accounts/exp-2/settings -H "$J" -d '{"floor_price": 9, "currency": "USD", "blocked_domains": [], "version": N}'`
+   **Ожидаемо:** `409 Conflict`. A должен перечитать настройки и повторить.
+4. Перезапусти API с выключенной блокировкой: `OPTIMISTIC_LOCKING_ENABLED=false mvn spring-boot:run`
+   (PowerShell: `$env:OPTIMISTIC_LOCKING_ENABLED="false"; mvn spring-boot:run`) и повтори шаги 1–3.
+   **Ожидаемо:** на шаге 3 — **200**, валюта снова `USD`: изменение B молча потеряно. В outbox обе версии,
+   и Serving получит обе, но последней будет версия без изменения B.
+
+### 20. Гонка: два PUT одновременно
+
+```bash
+V=$(curl -s localhost:8080/accounts/exp-2/settings | grep -o '"version":[0-9]*' | cut -d: -f2)
+curl -s -w ' %{http_code}\n' -X PUT localhost:8080/accounts/exp-2/settings -H "$J" -d "{\"floor_price\": 2, \"currency\": \"USD\", \"blocked_domains\": [], \"version\": $V}" &
+curl -s -w ' %{http_code}\n' -X PUT localhost:8080/accounts/exp-2/settings -H "$J" -d "{\"floor_price\": 3, \"currency\": \"USD\", \"blocked_domains\": [], \"version\": $V}" &
+wait
+```
+
+**Ожидаемо (блокировка включена):** один ответ 200, второй 409. Какой из них победит, зависит от случая.
+
+Чего ожидать на практике: запрос выполняется за миллисекунды, поэтому два `curl` почти никогда не
+пересекаются во времени. Обычно первый успевает закоммитить, а второй получает 409 от проверки `version`
+в `SettingsService` — как в последовательном сценарии. Если запросы всё-таки пересеклись (оба прочитали
+версию до коммита первого), 409 даст `@Version` в Hibernate. Какой механизм сработал, видно в логах API:
+`409 by client version check` или `409 by Hibernate @Version (concurrent update)`. Автотест
+`twoParallelPutsWithSameVersion_oneSucceedsOneGets409` запускает запросы одновременно через `CountDownLatch`,
+но и там порядок не гарантирован. Он проверяет только итог: один 200 и один 409. (При проверке 5 запусков
+подряд запросы пересекались каждый раз, и 409 давал `@Version` в Hibernate.)
+
+**С выключенной блокировкой** (`OPTIMISTIC_LOCKING_ENABLED=false`): если запросы не пересеклись, оба получат 200
+(lost update, как в эксперименте 19). Если пересеклись, второй всё равно получит 409 от `@Version`:
+одновременные записи Hibernate защищает всегда (см. README API, «Идемпотентность и optimistic locking»).
