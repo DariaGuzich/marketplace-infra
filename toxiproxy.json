@@ -1,0 +1,20 @@
+[
+  {
+    "name": "bff_to_api",
+    "listen": "0.0.0.0:18080",
+    "upstream": "api:8080",
+    "enabled": true
+  },
+  {
+    "name": "bff_to_reporting",
+    "listen": "0.0.0.0:18082",
+    "upstream": "reporting:8082",
+    "enabled": true
+  },
+  {
+    "name": "publisher_to_serving",
+    "listen": "0.0.0.0:18081",
+    "upstream": "serving:8081",
+    "enabled": true
+  }
+]

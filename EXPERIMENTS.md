@@ -654,3 +654,123 @@ mutation { addBlockedDomain(accountId: "<id>", domain: "via-bff.com") { blockedD
    домен один раз). В шаге 7 то же самое можно будет устроить через Toxiproxy между BFF и API.
 3. Если API остановлен: в логе BFF три строки `addBlockedDomain attempt N/3 failed (fetch failed), key ...`
    с **одинаковым** ключом, затем ошибка `Marketplace API unavailable after 3 attempts`.
+
+---
+
+## Шаг 7 второго этапа: вся система в docker-compose и Toxiproxy
+
+Подготовка: `docker compose up --build -d` (здесь), см. README. Команды — для Git Bash, сначала
+`export MSYS_NO_PATHCONV=1` (иначе `/toxiproxy-cli` превратится в путь Windows).
+
+```bash
+export MSYS_NO_PATHCONV=1
+J='Content-Type: application/json'
+tox() { docker compose exec toxiproxy /toxiproxy-cli "$@"; }
+gql() { curl -s localhost:4000/graphql -H "$J" -d "{\"query\": \"$1\"}"; echo; }
+curl -X PUT localhost:8080/accounts/tox-1/settings -H "$J" -d '{"floor_price": 1.5, "currency": "USD", "blocked_domains": []}'
+```
+
+Все эксперименты 43–47 проверены вручную на compose.
+
+### 43. Медленный Reporting: таймаут и частичный ответ
+
+```bash
+tox toxic add -t latency -a latency=3000 bff_to_reporting
+time gql 'query { accounts { id settings { floorPrice } report { hour } } }'
+tox toxic remove -n latency_downstream bff_to_reporting
+```
+
+**Ожидаемо:** ответ примерно через 1,3 с (таймаут BFF 1 с), а не через 3. `settings` на месте, `report: null`, в `errors` —
+`Reporting unavailable: The operation was aborted due to timeout`.
+
+### 44. Обрыв BFF → API
+
+```bash
+tox toggle bff_to_api
+gql 'query { settings(accountId: \"tox-1\") { floorPrice } }'
+tox toggle bff_to_api
+```
+
+**Ожидаемо:** `"settings": null` и ошибка `Unexpected error.` с `"code": "INTERNAL_SERVER_ERROR"`. Yoga
+намеренно скрывает текст непредвиденных ошибок (здесь `fetch failed`), чтобы не раскрывать клиенту внутренности.
+Явные ошибки резолверов (`Reporting unavailable`) видны, потому что созданы через `createGraphQLError`.
+После второго `toggle` всё снова работает.
+
+### 45. Повтор после потерянного ответа: BFF → API
+
+```bash
+tox toxic add -t latency -a latency=3000 bff_to_api
+time gql 'mutation { addBlockedDomain(accountId: \"tox-1\", domain: \"slow.com\") { blockedDomains } }'
+tox toxic remove -n latency_downstream bff_to_api
+curl localhost:8080/accounts/tox-1/settings
+docker compose logs bff | grep -E "blocked-domains|attempt"
+```
+
+**Ожидаемо:**
+- через ~6,5 с ошибка `Marketplace API unavailable after 3 attempts: ... timeout`;
+- в логе BFF три `POST /accounts/tox-1/blocked-domains` и три `attempt N/3 failed` с **одним и тем же ключом**;
+- **но** в API `slow.com` есть, и ровно **один раз**. Все три запроса дошли до API (задерживался только ответ):
+  первый добавил домен, второй и третий получили сохранённый ответ по `Idempotency-Key`.
+- Выводов два: «ошибка» у клиента не значит «не выполнено», а без ключа домен добавился бы трижды.
+
+### 46. Повторная доставка: Publisher → Serving
+
+```bash
+tox toxic add -t latency -a latency=3000 publisher_to_serving
+curl -X PUT localhost:8080/accounts/tox-1/settings -H "$J" -d '{"floor_price": 2.5, "currency": "USD", "blocked_domains": []}'
+# подожди ~20 секунд
+docker compose exec postgres psql -U marketplace -c "SELECT version, status FROM outbox WHERE account_id = 'tox-1' ORDER BY version;"
+tox toxic remove -n latency_downstream publisher_to_serving
+docker compose logs serving | grep "tox-1" | sort | uniq -c
+```
+
+**Ожидаемо:**
+- пока висит задержка, новая версия в outbox **`NEW`**, в логе publisher по кругу `Attempt 1/3, 2/3, 3/3`
+  и `Serving unavailable, stopping this cycle`;
+- после снятия задержки — `SENT`;
+- в логе Serving: `Applied ... version N` **один раз** и много `Ignored ... version N is not newer` (при проверке — 7).
+  Каждая попытка publisher дошла до Serving, применилась только первая.
+- **Наблюдение:** вместо явного таймаута publisher пишет `Error while extracting response ... content type [application/octet-stream]`.
+  Ошибка появляется только под задержкой, то есть это и есть недождавшийся ответ, но текст вводит в заблуждение.
+  Хорошо бы, чтобы publisher различал «таймаут» и «непонятный ответ».
+
+### 47. Serving → Reporting: потеря событий
+
+```bash
+docker compose stop reporting
+curl -X POST localhost:8081/ad-request -H "$J" -d '{"account_id": "tox-1", "domain": "news.com", "bid_price": 9}'
+docker compose logs serving | grep -E "Attempt|lost" | tail -4
+docker compose start reporting
+```
+
+**Ожидаемо:** ответ на `ad-request` приходит, в логе Serving три `Attempt N/3 to send event ... failed`
+и `Event ... lost`. В `reporting.events` этого события нет и не будет.
+
+---
+
+## Retry и дубли в системе
+
+Где в системе возникают повторы, к чему они приводят и чем защищено каждое место.
+
+| Место | Кто повторяет и когда | Что было бы без защиты | Защита | Где проверить |
+|---|---|---|---|---|
+| **BFF → API**, `addBlockedDomain` | BFF: таймаут, сетевая ошибка, 5xx — до 3 попыток | домен добавлен 2–3 раза | **Idempotency-Key**: один ключ на мутацию, API хранит ответ по ключу (`idempotency_keys`) в той же транзакции, что и изменение | 18, 42, 45; `retry.test.ts`, `IdempotencyApiTest` |
+| **BFF → API**, `updateSettings` (PUT) | никто | — | PUT идемпотентен по смыслу: повтор с теми же данными даёт тот же результат, новой версии не создаёт. Но повтор после чужой записи затрёт её — для этого `version` (optimistic locking) | 19, 20; `OptimisticLockingApiTest` |
+| **API → outbox → Publisher** | publisher: падение между отправкой и пометкой `SENT`, следующий цикл отправляет снова | — | **at-least-once**: outbox ничего не теряет, а дубли гасит получатель (строка ниже) | 25, 27; `CrashAfterSendTest` |
+| **Publisher → Serving** | publisher: таймаут, ошибка — 3 попытки, затем весь цикл повторяется | старая или та же версия применилась бы поверх новой; при перестановке — откат настроек | **версия конфига**: Serving применяет только версию больше текущей (сравнение и запись атомарно), повтор → 200 `applied: false` | 21, 27, 28, 46; `ConfigStoreTest` |
+| **Serving → Reporting** | Serving: таймаут, ошибка — 3 попытки с тем же `event_id` | событие посчитано дважды | **event_id**: `INSERT ... ON CONFLICT (event_id) DO NOTHING`. Но **потеря** возможна: после 3 неудач событие выброшено | 33, 37, 47; `EventSendingTest`, `ReportingApiTest` |
+| **Агрегация в Reporting** | расписание, ручной запуск, несколько экземпляров | цифры за час удваиваются | **пересчёт с нуля и замена** (`ON CONFLICT DO UPDATE SET requests = EXCLUDED.requests`) | 34; `rerunOfAggregationDoesNotDoubleCounts` |
+| **UI → BFF** | пользователь: двойной клик, повторная отправка формы | `addBlockedDomain` из UI добавил бы домен дважды | **нет защиты**: BFF создаёт новый ключ на каждую мутацию, два клика — две разные операции. Нужен ключ от клиента (UI создаёт его при открытии формы и передаёт в мутацию) | — |
+
+Общие правила, которые видны по этой таблице:
+
+1. **Повтор безопасен, только если получатель умеет узнавать повтор.** Узнаёт по идентификатору операции
+   (Idempotency-Key, event_id) или по версии (Serving). Ключ создаёт отправитель **один раз на операцию** и не
+   меняет его между попытками.
+2. **Ошибка у вызывающего не значит, что операция не выполнена** (45, 46): при таймауте ответа сосед уже мог
+   всё сделать. Поэтому «повторить» и «защититься от дубля» — всегда пара.
+3. **Без надёжного хранилища между сервисами повторы ограничены**, и данные могут теряться (Serving → Reporting).
+   С outbox повторять можно сколько угодно: запись лежит в базе, пока не доставлена.
+4. **«Ровно один раз»** на практике — это at-least-once + идемпотентный получатель.
+5. **Идемпотентность пересчёта** — заменять результат, а не прибавлять к нему: агрегат за час всегда считается
+   заново из сырых данных.

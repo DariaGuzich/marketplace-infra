@@ -1,5 +1,15 @@
 name: marketplace
 
+# Вся система одной командой: docker compose up --build
+# Сервисы собираются из соседних папок (../marketplace-*), репозитории должны лежать рядом.
+#
+# Связи BFF → API, BFF → Reporting и Publisher → Serving идут через Toxiproxy:
+# сервис обращается не к соседу напрямую, а к прокси, в котором можно добавить задержку или оборвать соединение.
+#
+#   ui ──► bff ──► toxiproxy:18080 ──► api ──► postgres (public: settings, outbox)
+#           └────► toxiproxy:18082 ──► reporting ──► postgres (reporting: events, hourly_stats)
+#   publisher ──► postgres (outbox), toxiproxy:18081 ──► serving ──► reporting (напрямую)
+
 services:
   postgres:
     image: postgres:18
@@ -16,6 +26,80 @@ services:
       test: ["CMD", "pg_isready", "-U", "marketplace"]
       interval: 2s
       retries: 15
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/config/toxiproxy.json:ro
+    ports:
+      - "8474:8474"   # HTTP API Toxiproxy (им же пользуется toxiproxy-cli)
+
+  api:
+    build: ../marketplace-api
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/marketplace
+      OPTIMISTIC_LOCKING_ENABLED: ${OPTIMISTIC_LOCKING_ENABLED:-true}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  reporting:
+    build: ../marketplace-reporting
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/marketplace
+      AGGREGATION_CRON: ${AGGREGATION_CRON:-0 5 * * * *}
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  serving:
+    build: ../marketplace-serving
+    environment:
+      REPORTING_URL: http://reporting:8082
+    ports:
+      - "8081:8081"
+
+  publisher:
+    build: ../marketplace-publisher
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/marketplace
+      SERVING_URL: http://toxiproxy:18081
+      CRASH_AFTER_SEND: ${CRASH_AFTER_SEND:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started   # таблицу outbox создают миграции API
+      toxiproxy:
+        condition: service_started
+
+  bff:
+    build: ../marketplace-bff
+    environment:
+      API_URL: http://toxiproxy:18080
+      REPORTING_URL: http://toxiproxy:18082
+      USE_DATALOADER: ${USE_DATALOADER:-true}
+    ports:
+      - "4000:4000"
+    depends_on:
+      - toxiproxy
+      - api
+      - reporting
+
+  ui:
+    build: ../marketplace-ui
+    environment:
+      # Адрес BFF для браузера (UI выполняется в браузере на хосте, а не в контейнере)
+      VITE_BFF_URL: http://localhost:4000/graphql
+    ports:
+      - "5173:5173"
+    depends_on:
+      - bff
 
 volumes:
   postgres-data:
