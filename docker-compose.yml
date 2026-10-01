@@ -1,0 +1,21 @@
+name: marketplace
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: marketplace
+      POSTGRES_USER: marketplace
+      POSTGRES_PASSWORD: marketplace
+    ports:
+      - "5432:5432"
+    volumes:
+      # Данные переживают перезапуск контейнера; удалить: docker compose down -v
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "marketplace"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  postgres-data:
